@@ -1,0 +1,6 @@
+{
+  "model": "model/best_e6_int8_openvino_model",
+  "conf": 0.15,
+  "iou": 0.45,
+  "imgsz": 640
+}
