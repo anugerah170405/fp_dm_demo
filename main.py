@@ -6,6 +6,7 @@ import glob
 import json
 import shutil
 import logging
+import threading
 logging.getLogger().setLevel(logging.ERROR)
 import cv2
 import pandas as pd
@@ -389,43 +390,95 @@ class App:
         console.print(f"[dim]Saved to:[/dim] [cyan]{self.out_img_dir}/[/cyan] [dim]&[/dim] [cyan]{self.csv_path}[/cyan]\n")
 
     def do_camera(self):
-        print("\n[CAMERA] Opening webcam... Press 'q' on video window to exit.")
-        cap = cv2.VideoCapture(0)
+        print("\n[CAMERA] Membuka webcam cepat... Tekan 'q' pada jendela video untuk keluar.")
+
+        # 1. Pilih backend native langsung agar kamera terbuka instan (AVFoundation di Mac, DSHOW di Windows)
+        backend = cv2.CAP_AVFOUNDATION if sys.platform == "darwin" else (cv2.CAP_DSHOW if os.name == 'nt' else cv2.CAP_ANY)
+        cap = cv2.VideoCapture(0, backend)
+
+        # 2. Set codec MJPG dan konfigurasi target 120 FPS
+        fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+        cap.set(cv2.CAP_PROP_FOURCC, fourcc)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_FPS, 120)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
         if not cap.isOpened():
-            print("[!] Camera unavailable or permission denied.")
+            print("[!] Kamera tidak tersedia atau izin akses ditolak.")
             return
 
-        f_count, last_boxes, last_status, prev_t, fps = 0, [], "Scanning...", time.time(), 30.0
+        # State thread-safe untuk berbagi hasil deteksi tanpa memblokir rendering video
+        state = {
+            "boxes": [],
+            "status": "Scanning...",
+            "latest_frame": None,
+            "running": True,
+            "new_frame_event": threading.Event()
+        }
+
+        # 3. Asynchronous Inference Thread (YOLO berjalan di background thread)
+        def inference_worker():
+            while state["running"]:
+                # Tunggu sinyal frame baru
+                if not state["new_frame_event"].wait(timeout=0.1):
+                    continue
+                state["new_frame_event"].clear()
+
+                frame_to_process = state["latest_frame"]
+                if frame_to_process is None or not state["running"]:
+                    continue
+
+                try:
+                    res, info = self.detector.predict(frame_to_process, imgsz=480)
+                    state["boxes"] = [(*map(int, b.xyxy[0]), float(b.conf[0])) for b in res.boxes]
+                    state["status"] = f"{info['status']} ({info['total']} lesions)"
+                except Exception:
+                    pass
+
+        infer_thread = threading.Thread(target=inference_worker, daemon=True)
+        infer_thread.start()
+
+        prev_t = time.perf_counter()
+        fps_smooth = 60.0
+
         try:
             while True:
                 ret, frame = cap.read()
-                if not ret: break
+                if not ret:
+                    break
 
-                f_count += 1
-                curr_t = time.time()
-                fps = 1.0 / (curr_t - prev_t) if (curr_t - prev_t) > 0 else 30.0
+                # Kirim frame terbaru ke background worker jika sedang idle
+                state["latest_frame"] = frame
+                state["new_frame_event"].set()
+
+                # Hitung FPS real-time rendering
+                curr_t = time.perf_counter()
+                dt = curr_t - prev_t
                 prev_t = curr_t
+                if dt > 0:
+                    fps_instant = 1.0 / dt
+                    fps_smooth = 0.9 * fps_smooth + 0.1 * fps_instant
 
-                # Run inference every 2 frames for smooth lightweight execution
-                if f_count % 2 == 0:
-                    res, info = self.detector.predict(frame, imgsz=480)
-                    last_boxes = [(*map(int, b.xyxy[0]), float(b.conf[0])) for b in res.boxes]
-                    last_status = f"{info['status']} ({info['total']} lesions)"
-
-                for (x1, y1, x2, y2, c) in last_boxes:
+                # Gambar deteksi terakhir di layar
+                for (x1, y1, x2, y2, c) in state["boxes"]:
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
-                    cv2.putText(frame, f"{c:.0%}", (x1, max(y1 - 4, 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+                    cv2.putText(frame, f"{c:.0%}", (x1, max(y1 - 4, 10)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
 
-                cv2.putText(frame, f"FPS: {fps:.0f} | {last_status}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                cv2.putText(frame, f"FPS: {fps_smooth:.0f} | {state['status']}", (10, 25),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                 cv2.imshow("FAW Scanner (Press 'q' to exit)", frame)
-                if cv2.waitKey(1) & 0xFF == ord('q'): break
+
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
         finally:
+            state["running"] = False
+            state["new_frame_event"].set()
             cap.release()
             cv2.destroyAllWindows()
-            for _ in range(3): cv2.waitKey(1)
+            for _ in range(3):
+                cv2.waitKey(1)
 
     def do_reset_output(self):
         count = 0
