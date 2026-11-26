@@ -100,7 +100,7 @@ class Menu:
             table.add_column(title, style="bold")
             for i, opt in enumerate(options):
                 num = str(i + 1)
-                line = f"[green]>[/green] [reverse] {opt} [/reverse]" if i == idx else f"  {opt}"
+                line = f"[green]●[/green] [reverse] {opt} [/reverse]" if i == idx else f"  {opt}"
                 table.add_row(num, line)
 
             buf = io.StringIO()
@@ -212,7 +212,7 @@ class App:
         while True:
             model_name = os.path.basename(self.cfg["model"])
             status = f"[{model_name} | conf {self.cfg['conf']:.2f} | {self.cfg['imgsz']}px]"
-            p = Menu.select(f"FAW DETECTION {status}", [
+            p = Menu.select(f"FAW DETECTION WITH YOLO {status}", [
                 "Detect Now",
                 "View CSV",
                 "Upload",
@@ -272,38 +272,54 @@ class App:
             Menu.select("Done", ["Back to Main Menu"])
 
     def do_upload(self):
-        path = None
-        # 1. Native GUI file dialog (tkinter built-in across Windows & Mac)
+        paths = []
+        # 1. Native GUI file dialog (Tkinter)
         try:
             import tkinter as tk
             from tkinter import filedialog
             root = tk.Tk()
             root.withdraw()
             root.attributes('-topmost', True)
-            path = filedialog.askopenfilename(
-                title="Pilih Gambar Daun Jagung",
+            selected = filedialog.askopenfilenames(
+                title="Pilih Gambar Daun Jagung (Bisa Banyak File)",
                 filetypes=[("Image files", "*.jpg *.jpeg *.png *.bmp *.webp"), ("All files", "*.*")]
             )
             root.destroy()
+            if selected:
+                paths = list(selected)
         except Exception:
             pass
 
-        # 2. Fallback to macOS osascript if tkinter unavailable
-        if not path and sys.platform == "darwin":
-            cmd = "osascript -e 'POSIX path of (choose file of type {\"public.image\"} with prompt \"Select Leaf Image:\")' 2>/dev/null"
-            path = os.popen(cmd).read().strip()
+        # 2. Fallback to macOS osascript (mendukung multiple files)
+        if not paths and sys.platform == "darwin":
+            cmd = (
+                "osascript -e '"
+                "set chosen to choose file of type {\"public.image\"} with prompt \"Select Leaf Image:\" with multiple selections allowed\n"
+                "set out to \"\"\n"
+                "repeat with f in chosen\n"
+                "    set out to out & POSIX path of f & linefeed\n"
+                "end repeat\n"
+                "return out' 2>/dev/null"
+            )
+            res = os.popen(cmd).read().strip()
+            if res:
+                paths = [p.strip() for p in res.splitlines() if p.strip()]
 
-        # 3. Fallback to terminal input prompt
-        if not path:
-            print("\n[Input Manual] Masukkan path file gambar (atau tekan Enter untuk batal):")
-            path = input("> ").strip().strip('"').strip("'")
+        if not paths:
+            return
 
-        if path and os.path.exists(path):
-            dest = os.path.join(self.upload_dir, os.path.basename(path))
-            shutil.copy(path, dest)
-            print(f"\n[OK] Berhasil mengunggah: {os.path.basename(path)}\n")
-        elif path:
-            print(f"\n[!] File tidak ditemukan: {path}\n")
+        success_count = 0
+        for p in paths:
+            if os.path.exists(p):
+                dest = os.path.join(self.upload_dir, os.path.basename(p))
+                shutil.copy(p, dest)
+                print(f"[OK] Berhasil mengunggah: {os.path.basename(p)}")
+                success_count += 1
+            else:
+                print(f"[!] File tidak ditemukan: {p}")
+
+        if success_count > 0:
+            print(f"\nTotal berhasil diunggah: {success_count} gambar.\n")
 
     def do_detect(self):
         files = []
@@ -341,8 +357,8 @@ class App:
                 continue
             fname = os.path.basename(path)
             res, info = self.detector.predict(path)
-
-            out_path = os.path.join(self.out_img_dir, f"hasil_{fname}")
+            model_name = os.path.splitext(os.path.basename(self.cfg["model"]))[0]
+            out_path = os.path.join(self.out_img_dir, f"hasil_{model_name}_{fname}")
             cv2.imwrite(out_path, res.plot())
 
             conf_str = f"{info['avg_conf']:.1%}" if info['total'] else "-"
